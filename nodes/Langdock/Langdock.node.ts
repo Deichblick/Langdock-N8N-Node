@@ -1,11 +1,19 @@
 import type {
 	IDataObject,
 	IExecuteFunctions,
+	ILoadOptionsFunctions,
 	INodeExecutionData,
+	INodePropertyOptions,
 	INodeType,
 	INodeTypeDescription,
 } from 'n8n-workflow';
 import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
+
+function getBaseUrl(credentials: IDataObject): string {
+	return credentials.environment === 'dedicated'
+		? (credentials.baseUrl as string).replace(/\/+$/, '')
+		: 'https://api.langdock.com';
+}
 
 export class Langdock implements INodeType {
 	description: INodeTypeDescription = {
@@ -101,12 +109,13 @@ export class Langdock implements INodeType {
 				description: 'System instructions for the temporary Agent (max. 16384 characters).',
 			},
 			{
-				displayName: 'Model',
+				displayName: 'Model Name or ID',
 				name: 'agentModel',
-				type: 'string',
+				type: 'options',
+				typeOptions: { loadOptionsMethod: 'getAgentModels' },
 				default: 'gpt-4o',
 				displayOptions: { show: { resource: ['agent'], agentSource: ['inline'] } },
-				description: 'Model ID to use for the temporary Agent',
+				description: 'Model ID to use for the temporary Agent. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
 			},
 			{
 				displayName: 'Temperature',
@@ -121,13 +130,14 @@ export class Langdock implements INodeType {
 			// Chat Completion
 			// ---------------------------------------------------------------
 			{
-				displayName: 'Model',
+				displayName: 'Model Name or ID',
 				name: 'chatModel',
-				type: 'string',
+				type: 'options',
+				typeOptions: { loadOptionsMethod: 'getChatModels' },
 				default: 'gpt-4o',
 				required: true,
 				displayOptions: { show: { resource: ['chatCompletion'] } },
-				description: 'Model ID as offered by Langdock, e.g. gpt-4o, claude-sonnet-4-5, gemini-2.5-pro',
+				description: 'Model to use, as offered by Langdock for your workspace and region. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
 			},
 			{
 				displayName: 'System Message',
@@ -186,12 +196,14 @@ export class Langdock implements INodeType {
 			// Embedding
 			// ---------------------------------------------------------------
 			{
-				displayName: 'Model',
+				displayName: 'Model Name or ID',
 				name: 'embeddingModel',
-				type: 'string',
+				type: 'options',
+				typeOptions: { loadOptionsMethod: 'getEmbeddingModels' },
 				default: 'text-embedding-3-small',
 				required: true,
 				displayOptions: { show: { resource: ['embedding'] } },
+				description: 'Embedding model to use. Choose from the list, or specify an ID using an <a href="https://docs.n8n.io/code/expressions/">expression</a>.',
 			},
 			{
 				displayName: 'Text',
@@ -334,16 +346,69 @@ export class Langdock implements INodeType {
 		],
 	};
 
+	methods = {
+		loadOptions: {
+			async getAgentModels(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const credentials = await this.getCredentials('langdockApi');
+				const baseUrl = getBaseUrl(credentials);
+
+				const response = (await this.helpers.httpRequestWithAuthentication.call(this, 'langdockApi', {
+					method: 'GET',
+					url: `${baseUrl}/agent/v1/models`,
+					json: true,
+				})) as IDataObject;
+
+				const models = (response.data as IDataObject[]) || [];
+				return models
+					.map((model) => ({ name: model.id as string, value: model.id as string }))
+					.sort((a, b) => a.name.localeCompare(b.name));
+			},
+
+			async getChatModels(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const credentials = await this.getCredentials('langdockApi');
+				const baseUrl = getBaseUrl(credentials);
+				const region = (credentials.region as string) || 'eu';
+
+				const response = (await this.helpers.httpRequestWithAuthentication.call(this, 'langdockApi', {
+					method: 'GET',
+					url: `${baseUrl}/openai/${region}/v1/models`,
+					json: true,
+				})) as IDataObject;
+
+				const models = (response.data as IDataObject[]) || [];
+				return models
+					.map((model) => ({ name: model.id as string, value: model.id as string }))
+					.sort((a, b) => a.name.localeCompare(b.name));
+			},
+
+			async getEmbeddingModels(this: ILoadOptionsFunctions): Promise<INodePropertyOptions[]> {
+				const credentials = await this.getCredentials('langdockApi');
+				const baseUrl = getBaseUrl(credentials);
+				const region = (credentials.region as string) || 'eu';
+
+				const response = (await this.helpers.httpRequestWithAuthentication.call(this, 'langdockApi', {
+					method: 'GET',
+					url: `${baseUrl}/openai/${region}/v1/models`,
+					json: true,
+				})) as IDataObject;
+
+				const models = (response.data as IDataObject[]) || [];
+				const embeddingModels = models.filter((model) => (model.id as string).toLowerCase().includes('embed'));
+				const list = embeddingModels.length ? embeddingModels : models;
+
+				return list
+					.map((model) => ({ name: model.id as string, value: model.id as string }))
+					.sort((a, b) => a.name.localeCompare(b.name));
+			},
+		},
+	};
+
 	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
 		const items = this.getInputData();
 		const returnData: INodeExecutionData[] = [];
 
 		const credentials = await this.getCredentials('langdockApi');
-		const environment = credentials.environment as string;
-		const baseUrl =
-			environment === 'dedicated'
-				? (credentials.baseUrl as string).replace(/\/+$/, '')
-				: 'https://api.langdock.com';
+		const baseUrl = getBaseUrl(credentials);
 		const region = (credentials.region as string) || 'eu';
 
 		const resource = this.getNodeParameter('resource', 0) as string;

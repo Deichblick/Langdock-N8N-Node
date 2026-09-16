@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-langdock",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "n8n community node to call the Langdock API: send messages to Langdock Agents, run OpenAI-compatible chat completions across providers, and create text embeddings.",
   "keywords": [
     "n8n-community-node-package",
