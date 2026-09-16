@@ -32,7 +32,7 @@ Requests are only allowed from a backend context — the Langdock API blocks cal
 
 The **Langdock** node supports three resources:
 
-- **Agent** — send a message to an existing Agent (by ID) or to a temporary, inline-configured Agent, and get its reply. Supports multi-turn conversations (via *Previous Messages*), file attachments, tool-step limits, web search, and structured (JSON schema / enum) output. This is the only resource with access to non-OpenAI models (Anthropic, Google, ...), since Langdock routes the Agent API to whichever provider the selected model belongs to.
+- **Agent** — send a message to an existing Agent (by ID) or to a temporary, inline-configured Agent, and get its reply. Supports multi-turn conversations (via *Previous Messages*), file attachments, tool-step limits, web search, streaming, and structured (JSON schema / enum) output. This is the only resource with access to non-OpenAI models (Anthropic, Google, ...), since Langdock routes the Agent API to whichever provider the selected model belongs to.
 - **Chat Completion** — calls Langdock's OpenAI-compatible completion endpoint (`/openai/{region}/v1/chat/completions`). This endpoint is **OpenAI-only**: the Model dropdown only lists OpenAI models. Claude and other providers are exposed through separate, differently-shaped Langdock endpoints and are not wired into this resource — use **Agent** (Temporary Agent) instead if you need a non-OpenAI model.
 - **Embedding** — create text embeddings via the OpenAI-compatible embeddings endpoint.
 
@@ -64,7 +64,23 @@ Workflows built before this option was added are unaffected — they keep runnin
 
 **Timeout (Seconds)** (default `300`, range `1`–`900`) sets how long the node waits for a Langdock API response, for Agent, Chat Completion and Embedding requests. It is **not** sent to the model-list dropdowns.
 
-Note that Langdock's own non-streaming request handling may enforce a shorter server-side limit — around 100 seconds for the Agent Completions endpoint — regardless of this setting. Raising Timeout (Seconds) beyond that only helps if the bottleneck is network/n8n-side; it does not change what Langdock itself allows server-side. For long-running Agent tasks, prefer smaller `Max Steps` / shorter prompts, or Langdock's `stream: true` mode (not currently exposed by this node) over relying purely on a longer client timeout.
+Note that Langdock's own non-streaming request handling may enforce a shorter server-side limit — around 100 seconds for the Agent Completions endpoint — regardless of this setting. Raising Timeout (Seconds) beyond that only helps if the bottleneck is network/n8n-side; it does not change what Langdock itself allows server-side. For long-running Agent tasks (e.g. web research), enable **Stream Response** (below) instead of relying purely on a longer client timeout.
+
+**Timeout semantics**: Timeout (Seconds) is a **total-duration deadline**, not a per-chunk/idle timeout. For a streamed request it is measured once, from the moment the node starts reading the response, and covers the entire stream regardless of how many chunks arrive or how long the gaps between them are — a slow-but-steadily-streaming response is not killed just because an individual chunk took a while, only the overall deadline is enforced. When it's hit, the node closes the connection and reports a timeout error (for a non-streaming request, the same field is simply passed as the HTTP client's request timeout).
+
+### Streaming (Agent only)
+
+Enable **Stream Response** (under Resource = Agent) to send `stream: true` to Langdock's Agent Completions endpoint (`POST /agent/v1/chat/completions`) and read the reply incrementally as Langdock sends it, instead of waiting for one buffered response. This works with both **Existing Agent (by ID)** and **Temporary Agent (Inline Configuration)**, and combines with Web Search, Output Format and Structured Output exactly as described above. It does **not** apply to Chat Completion or Embedding — Chat Completion's `/openai/{region}/...` endpoint uses a different (OpenAI-style) streaming wire format that this node does not implement, and Embedding responses are never streamed.
+
+Why this exists: a long web-research Agent call can run past the ~100 second non-streaming limit and gets killed with an HTTP 524 (Cloudflare: origin didn't respond in time) before Langdock ever gets to send a result. Streaming keeps the HTTP connection open for as long as Langdock keeps sending SSE chunks on it, which is generally more resilient to that specific failure mode.
+
+**This is not a guarantee against 524s.** Streaming only helps because Cloudflare (and most reverse proxies) reset their idle/response timers on each byte received — it still requires Langdock to keep sending *something* (even a keepalive) at reasonable intervals. If Langdock's own backend stalls without emitting any chunk for longer than the proxy's timeout, or drops the connection outright, you can still get an abrupt disconnect or a 524, now surfaced by this node as "the Langdock stream ended before a finish/[DONE] signal was received" or "Langdock stream connection error" rather than a plain 524.
+
+**Output while streaming** (mirrors the non-streaming shapes described above, additively):
+
+- `Simplify Output = true`, `Output Format = Text` → `{ "reply": "<assembled text>" }`
+- `Simplify Output = true`, `Output Format = JSON` → `{ "reply": "<assembled text>", "output": {...} }` — `output` comes from an explicit structured-output chunk if Langdock sends one, otherwise the node `JSON.parse`s the fully assembled text once the stream completes. If that still isn't valid JSON, the node throws a clear error rather than returning broken/partial JSON — structured output is only ever validated after the stream has fully finished, never on partial chunks.
+- `Simplify Output = false` → `{ "messages": [{ "id": ..., "role": "assistant", "content": "<assembled text>" }], "output"?: {...}, "sources"?: [...], "toolCalls"?: [...] }`. `messages`/`output` match the non-streaming response shape; `sources` (from `source-url`/`source-document` chunks) and `toolCalls` (from `tool-*` chunks) are additive streaming-only fields, only present when Langdock actually sent that kind of chunk.
 
 ### Example: company research agent
 
@@ -93,6 +109,7 @@ A temporary Agent with web search, JSON output and a longer timeout, useful for 
   }
   ```
 - **Timeout (Seconds)**: `120` (web search + reasoning can take longer than the default single-turn case)
+- **Stream Response**: enabled, if research regularly takes long enough to risk a 524 (see [Streaming](#streaming-agent-only) above)
 
 ## Compatibility
 
