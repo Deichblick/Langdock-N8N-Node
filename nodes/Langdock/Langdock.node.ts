@@ -11,6 +11,7 @@ import type {
 } from 'n8n-workflow';
 import { NodeConnectionTypes, NodeOperationError } from 'n8n-workflow';
 
+import { buildErrorItem, withTransientRetries } from './Retry';
 import { consumeLangdockStream } from './StreamTransport';
 
 function getBaseUrl(credentials: IDataObject): string {
@@ -304,6 +305,14 @@ export class Langdock implements INodeType {
 						displayOptions: { show: { outputType: ['enum'] } },
 					},
 					{
+						displayName: 'Max Retries',
+						name: 'maxRetries',
+						type: 'number',
+						typeOptions: { minValue: 0, maxValue: 10 },
+						default: 3,
+						description: 'Maximum additional attempts per item after a transient failure',
+					},
+					{
 						displayName: 'Max Steps',
 						name: 'maxSteps',
 						type: 'number',
@@ -325,6 +334,22 @@ export class Langdock implements INodeType {
 						type: 'json',
 						default: '',
 						description: 'Array of earlier messages (UIMessage format) to prepend, for multi-turn conversations',
+					},
+					{
+						displayName: 'Retry Delay (Seconds)',
+						name: 'retryDelaySeconds',
+						type: 'number',
+						typeOptions: { minValue: 0, maxValue: 120 },
+						default: 15,
+						description: 'Initial delay before retrying; subsequent delays increase exponentially up to 120 seconds',
+					},
+					{
+						displayName: 'Retry Transient Errors',
+						name: 'retryTransientErrors',
+						type: 'boolean',
+						default: false,
+						description:
+							'Whether to retry transient Langdock failures per input item (408, 429, 502, 503, 504, 524, and interrupted streams)',
 					},
 					{
 						displayName: 'Structured Output Type',
@@ -568,68 +593,80 @@ export class Langdock implements INodeType {
 						body.output = output;
 					}
 
-					if (streamResponse) {
-						body.stream = true;
+					const retryEnabled = additionalFields.retryTransientErrors === true;
+					const maxRetries = Number(additionalFields.maxRetries ?? 3);
+					const retryDelaySeconds = Number(additionalFields.retryDelaySeconds ?? 15);
 
-						const fullResponse = (await this.helpers.httpRequestWithAuthentication.call(this, 'langdockApi', {
-							method: 'POST',
-							url: `${baseUrl}/agent/v1/chat/completions`,
-							body,
-							json: true,
-							encoding: 'stream',
-							returnFullResponse: true,
-							timeout: timeoutMs,
-						})) as IN8nHttpFullResponse;
+					responseData = await withTransientRetries(
+						async (): Promise<IDataObject> => {
+							if (streamResponse) {
+								body.stream = true;
 
-						const streamResult = await consumeLangdockStream(this, i, fullResponse.body as Readable, timeoutMs);
+								const fullResponse = (await this.helpers.httpRequestWithAuthentication.call(this, 'langdockApi', {
+									method: 'POST',
+									url: `${baseUrl}/agent/v1/chat/completions`,
+									body,
+									json: true,
+									encoding: 'stream',
+									returnFullResponse: true,
+									timeout: timeoutMs,
+								})) as IN8nHttpFullResponse;
 
-						const assembledMessage: IDataObject = {
-							id: `n8n-stream-${Date.now()}-${i}`,
-							role: 'assistant',
-							content: streamResult.text,
-						};
-						responseData = { messages: [assembledMessage] };
-						if (streamResult.output !== undefined) responseData.output = streamResult.output;
-						if (streamResult.sources.length) responseData.sources = streamResult.sources;
-						if (streamResult.toolCalls.length) responseData.toolCalls = streamResult.toolCalls;
+								const streamResult = await consumeLangdockStream(this, i, fullResponse.body as Readable, timeoutMs);
 
-						if (simplifyOutput) {
-							if (outputFormat === 'json') {
-								let jsonOutput = streamResult.output;
-								if (jsonOutput === undefined) {
-									try {
-										jsonOutput = JSON.parse(streamResult.text);
-									} catch {
-										throw new NodeOperationError(
-											this.getNode(),
-											'Output Format is JSON, but the streamed response did not contain valid JSON once complete.',
-											{ itemIndex: i },
-										);
+								const assembledMessage: IDataObject = {
+									id: `n8n-stream-${Date.now()}-${i}`,
+									role: 'assistant',
+									content: streamResult.text,
+								};
+								let streamedData: IDataObject = { messages: [assembledMessage] };
+								if (streamResult.output !== undefined) streamedData.output = streamResult.output;
+								if (streamResult.sources.length) streamedData.sources = streamResult.sources;
+								if (streamResult.toolCalls.length) streamedData.toolCalls = streamResult.toolCalls;
+
+								if (simplifyOutput) {
+									if (outputFormat === 'json') {
+										let jsonOutput = streamResult.output;
+										if (jsonOutput === undefined) {
+											try {
+												jsonOutput = JSON.parse(streamResult.text);
+											} catch {
+												throw new NodeOperationError(
+													this.getNode(),
+													'Output Format is JSON, but the streamed response did not contain valid JSON once complete.',
+													{ itemIndex: i },
+												);
+											}
+										}
+										streamedData = { reply: streamResult.text, output: jsonOutput as IDataObject };
+									} else {
+										streamedData = { reply: streamResult.text };
 									}
 								}
-								responseData = { reply: streamResult.text, output: jsonOutput as IDataObject };
-							} else {
-								responseData = { reply: streamResult.text };
+								return streamedData;
 							}
-						}
-					} else {
-						responseData = (await this.helpers.httpRequestWithAuthentication.call(this, 'langdockApi', {
-							method: 'POST',
-							url: `${baseUrl}/agent/v1/chat/completions`,
-							body,
-							json: true,
-							timeout: timeoutMs,
-						})) as IDataObject;
 
-						if (simplifyOutput) {
-							const apiMessages = (responseData.messages as IDataObject[]) || [];
+							const rawResponse = (await this.helpers.httpRequestWithAuthentication.call(this, 'langdockApi', {
+								method: 'POST',
+								url: `${baseUrl}/agent/v1/chat/completions`,
+								body,
+								json: true,
+								timeout: timeoutMs,
+							})) as IDataObject;
+
+							if (!simplifyOutput) return rawResponse;
+
+							const apiMessages = (rawResponse.messages as IDataObject[]) || [];
 							const last = apiMessages[apiMessages.length - 1] as IDataObject | undefined;
-							responseData = {
-								reply: last?.content ?? '',
-								output: responseData.output,
-							};
-						}
-					}
+							return { reply: last?.content ?? '', output: rawResponse.output };
+						},
+						{
+							enabled: retryEnabled,
+							maxRetries,
+							baseDelayMs: Math.max(0, Math.min(120000, retryDelaySeconds * 1000)),
+							maxDelayMs: 120000,
+						},
+					);
 				} else if (resource === 'chatCompletion') {
 					const timeoutMs = resolveTimeoutMs(this, i);
 					const model = this.getNodeParameter('chatModel', i) as string;
@@ -720,7 +757,7 @@ export class Langdock implements INodeType {
 			} catch (error) {
 				if (this.continueOnFail()) {
 					returnData.push({
-						json: { error: (error as Error).message },
+						json: buildErrorItem(items[i].json, error),
 						pairedItem: { item: i },
 					});
 					continue;

@@ -82,6 +82,18 @@ Why this exists: a long web-research Agent call can run past the ~100 second non
 - `Simplify Output = true`, `Output Format = JSON` → `{ "reply": "<assembled text>", "output": {...} }` — `output` comes from an explicit structured-output chunk if Langdock sends one, otherwise the node `JSON.parse`s the fully assembled text once the stream completes. If that still isn't valid JSON, the node throws a clear error rather than returning broken/partial JSON — structured output is only ever validated after the stream has fully finished, never on partial chunks.
 - `Simplify Output = false` → `{ "messages": [{ "id": ..., "role": "assistant", "content": "<assembled text>" }], "output"?: {...}, "sources"?: [...], "toolCalls"?: [...] }`. `messages`/`output` match the non-streaming response shape; `sources` (from `source-url`/`source-document` chunks) and `toolCalls` (from `tool-*` chunks) are additive streaming-only fields, only present when Langdock actually sent that kind of chunk.
 
+### Retry on Transient Errors (Agent only)
+
+Under Agent → *Additional Fields*:
+
+- **Retry Transient Errors** (default off) — when enabled, automatically retries a failed request for that item.
+- **Max Retries** (default `3`, `0`–`10`) — additional attempts after the first failure.
+- **Retry Delay (Seconds)** (default `15`, `0`–`120`) — initial backoff delay; each subsequent retry doubles it, capped at 120 seconds, plus a little jitter. If Langdock's response includes a `Retry-After` header, that value is used instead when it's longer.
+
+A failure is only retried when it looks transient: HTTP `408`, `429`, `502`, `503`, `504` or `524` (Cloudflare gateway timeout), or one of this node's own "stream never completed" errors (see [Streaming](#streaming-agent-only) above). A cancelled execution and an explicit API error chunk are never retried, even though they can otherwise look similar. Retries happen per item and are transparent to downstream nodes on success — they only become visible if every attempt fails.
+
+With **Continue On Fail** enabled on the node, every error item (for any resource) now includes retry diagnostics alongside the usual `error` message: `langdockError: true`, `statusCode` (if one could be determined), `attempts`, and `retryable`. For Chat Completion and Embedding — which have no retry option and are never retried — `attempts` is simply `1`; `retryable` reflects whether the failure *would* have been considered transient. The existing `error` field's value is unchanged, so workflows built before this option was added keep working.
+
 ### Example: company research agent
 
 A temporary Agent with web search, JSON output and a longer timeout, useful for structured company lookups:
