@@ -1,6 +1,6 @@
 {
   "name": "n8n-nodes-langdock",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "n8n community node to call the Langdock API: send messages to Langdock Agents, run OpenAI-compatible chat completions across providers, and create text embeddings.",
   "keywords": [
     "n8n-community-node-package",
@@ -24,7 +24,8 @@
     "format": "prettier nodes credentials --write",
     "lint": "eslint nodes credentials package.json",
     "lintfix": "eslint nodes credentials package.json --fix",
-    "prepublishOnly": "npm run build && npm run lint"
+    "test": "jest",
+    "prepublishOnly": "npm run build && npm run lint && npm test"
   },
   "files": [
     "dist"
@@ -39,13 +40,16 @@
     ]
   },
   "devDependencies": {
+    "@types/jest": "^30.0.0",
     "@typescript-eslint/parser": "^7.0.0",
     "eslint": "^8.57.0",
     "eslint-plugin-n8n-nodes-base": "^1.16.1",
     "gulp": "^4.0.2",
+    "jest": "^30.5.1",
     "jsonc-eslint-parser": "^3.3.0",
     "n8n-workflow": "*",
     "prettier": "^3.3.2",
+    "ts-jest": "^29.4.12",
     "typescript": "^5.4.5"
   },
   "peerDependencies": {

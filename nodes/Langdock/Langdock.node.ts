@@ -15,6 +15,21 @@ function getBaseUrl(credentials: IDataObject): string {
 		: 'https://api.langdock.com';
 }
 
+function resolveTimeoutMs(context: IExecuteFunctions, itemIndex: number): number {
+	const raw = context.getNodeParameter('requestTimeoutSeconds', itemIndex, 300) as number | string;
+	const seconds = typeof raw === 'number' ? raw : Number(raw);
+
+	if (!Number.isFinite(seconds) || seconds < 1 || seconds > 900) {
+		throw new NodeOperationError(
+			context.getNode(),
+			`Invalid Timeout (Seconds) value "${String(raw)}". Must be a number between 1 and 900.`,
+			{ itemIndex },
+		);
+	}
+
+	return Math.round(seconds * 1000);
+}
+
 export class Langdock implements INodeType {
 	description: INodeTypeDescription = {
 		displayName: 'Langdock',
@@ -125,6 +140,14 @@ export class Langdock implements INodeType {
 				default: 0.7,
 				displayOptions: { show: { resource: ['agent'], agentSource: ['inline'] } },
 			},
+			{
+				displayName: 'Web Search',
+				name: 'webSearch',
+				type: 'boolean',
+				default: false,
+				displayOptions: { show: { resource: ['agent'], agentSource: ['inline'] } },
+				description: "Whether to enable the temporary Agent's web search capability for this request",
+			},
 
 			// ---------------------------------------------------------------
 			// Chat Completion
@@ -190,6 +213,19 @@ export class Langdock implements INodeType {
 				required: true,
 				displayOptions: { show: { resource: ['chatCompletion'], inputMode: ['json'] } },
 				description: 'Full messages array in OpenAI format (role, content)',
+			},
+			{
+				displayName: 'Output Format',
+				name: 'outputFormat',
+				type: 'options',
+				displayOptions: { show: { resource: ['agent', 'chatCompletion'] } },
+				options: [
+					{ name: 'Text', value: 'text' },
+					{ name: 'JSON', value: 'json' },
+				],
+				default: 'text',
+				description:
+					'Whether to return the free-form text reply (default) or technically force a JSON response. For Agent, JSON defaults to an object output unless Structured Output Type in Additional Fields already requests Array or Enum. For Chat Completion, JSON uses the OpenAI-compatible json_object response format, if supported by the selected model.',
 			},
 
 			// ---------------------------------------------------------------
@@ -267,7 +303,8 @@ export class Langdock implements INodeType {
 						name: 'outputSchema',
 						type: 'json',
 						default: '',
-						displayOptions: { show: { outputType: ['object', 'array'] } },
+						description:
+							'Optional JSON Schema for the structured output. Used when Structured Output Type is Object/Array, or together with Output Format = JSON.',
 					},
 					{
 						displayName: 'Previous Messages (JSON)',
@@ -336,6 +373,16 @@ export class Langdock implements INodeType {
 				],
 			},
 
+			{
+				displayName: 'Timeout (Seconds)',
+				name: 'requestTimeoutSeconds',
+				type: 'number',
+				typeOptions: { minValue: 1, maxValue: 900 },
+				default: 300,
+				displayOptions: { show: { resource: ['agent', 'chatCompletion', 'embedding'] } },
+				description:
+					'Maximum time to wait for the Langdock API response, in seconds (1-900). Langdock itself may enforce a shorter server-side limit (around 100 seconds) for non-streaming requests, independent of this value; use streaming or a smaller request if you hit that limit.',
+			},
 			{
 				displayName: 'Simplify Output',
 				name: 'simplifyOutput',
@@ -419,18 +466,27 @@ export class Langdock implements INodeType {
 				let responseData: IDataObject = {};
 
 				if (resource === 'agent') {
+					const timeoutMs = resolveTimeoutMs(this, i);
 					const agentSource = this.getNodeParameter('agentSource', i) as string;
+					const outputFormat = this.getNodeParameter('outputFormat', i, 'text') as string;
 					const body: IDataObject = {};
 
 					if (agentSource === 'id') {
 						body.agentId = this.getNodeParameter('agentId', i) as string;
 					} else {
-						body.agent = {
+						const agentConfig: IDataObject = {
 							name: this.getNodeParameter('agentName', i) as string,
 							instructions: this.getNodeParameter('agentInstructions', i) as string,
 							model: this.getNodeParameter('agentModel', i) as string,
 							temperature: this.getNodeParameter('agentTemperature', i) as number,
 						};
+
+						const webSearch = this.getNodeParameter('webSearch', i, false) as boolean;
+						if (webSearch) {
+							agentConfig.capabilities = { webSearch: true };
+						}
+
+						body.agent = agentConfig;
 					}
 
 					const additionalFields = this.getNodeParameter('additionalFields', i, {}) as IDataObject;
@@ -487,11 +543,23 @@ export class Langdock implements INodeType {
 						body.output = output;
 					}
 
+					// Output Format = JSON forces a structured (object) output, but never
+					// overrides an explicit Array/Enum choice made above via Structured Output Type.
+					if (outputFormat === 'json' && !body.output) {
+						const output: IDataObject = { type: 'object' };
+						if (additionalFields.outputSchema) {
+							const rawSchema = additionalFields.outputSchema;
+							output.schema = typeof rawSchema === 'string' ? JSON.parse(rawSchema) : rawSchema;
+						}
+						body.output = output;
+					}
+
 					responseData = (await this.helpers.httpRequestWithAuthentication.call(this, 'langdockApi', {
 						method: 'POST',
 						url: `${baseUrl}/agent/v1/chat/completions`,
 						body,
 						json: true,
+						timeout: timeoutMs,
 					})) as IDataObject;
 
 					if (simplifyOutput) {
@@ -503,8 +571,10 @@ export class Langdock implements INodeType {
 						};
 					}
 				} else if (resource === 'chatCompletion') {
+					const timeoutMs = resolveTimeoutMs(this, i);
 					const model = this.getNodeParameter('chatModel', i) as string;
 					const inputMode = this.getNodeParameter('inputMode', i) as string;
+					const outputFormat = this.getNodeParameter('outputFormat', i, 'text') as string;
 					const chatAdditionalFields = this.getNodeParameter('chatAdditionalFields', i, {}) as IDataObject;
 
 					let messages: IDataObject[];
@@ -527,19 +597,35 @@ export class Langdock implements INodeType {
 						...chatAdditionalFields,
 					};
 
+					if (outputFormat === 'json') {
+						body.response_format = { type: 'json_object' };
+					}
+
 					responseData = (await this.helpers.httpRequestWithAuthentication.call(this, 'langdockApi', {
 						method: 'POST',
 						url: `${baseUrl}/openai/${region}/v1/chat/completions`,
 						body,
 						json: true,
+						timeout: timeoutMs,
 					})) as IDataObject;
 
 					if (simplifyOutput) {
 						const choices = (responseData.choices as IDataObject[]) || [];
 						const message = (choices[0]?.message as IDataObject) || {};
-						responseData = { reply: message.content ?? '', usage: responseData.usage };
+						let reply: string | IDataObject = (message.content as string) ?? '';
+
+						if (outputFormat === 'json' && typeof reply === 'string') {
+							try {
+								reply = JSON.parse(reply);
+							} catch {
+								// Model did not return valid JSON; fall back to the raw string.
+							}
+						}
+
+						responseData = { reply, usage: responseData.usage };
 					}
 				} else if (resource === 'embedding') {
+					const timeoutMs = resolveTimeoutMs(this, i);
 					const model = this.getNodeParameter('embeddingModel', i) as string;
 					const input = this.getNodeParameter('embeddingInput', i) as string | string[];
 					const encodingFormat = this.getNodeParameter('encodingFormat', i, 'float') as string;
@@ -555,6 +641,7 @@ export class Langdock implements INodeType {
 						url: `${baseUrl}/openai/${region}/v1/embeddings`,
 						body,
 						json: true,
+						timeout: timeoutMs,
 					})) as IDataObject;
 
 					if (simplifyOutput) {
